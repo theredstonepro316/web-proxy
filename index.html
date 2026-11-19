@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web Proxy</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fff; --fg:#1c1c1e; --muted:#6b6b70; --line:#d8d8dc; --accent:#2563eb; --bar:#f3f3f5; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161618; --fg:#ececee; --muted:#9a9aa0; --line:#38383c; --accent:#6b9bff; --bar:#202023; } }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { display: flex; flex-direction: column; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
+  header { display: flex; gap: 6px; padding: 8px; background: var(--bar); border-bottom: 1px solid var(--line); }
+  button, select, input { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+  button { cursor: pointer; } button:disabled { opacity: .4; cursor: default; }
+  #go { background: var(--accent); color: #fff; border-color: var(--accent); }
+  #url { flex: 1; min-width: 0; }
+  details { padding: 6px 10px; background: var(--bar); border-bottom: 1px solid var(--line); color: var(--muted); }
+  details > div { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding-top: 8px; }
+  #custom { flex: 1; min-width: 220px; }
+  #status { padding: 4px 10px; min-height: 26px; color: var(--muted); font-size: 13px; }
+  #status.err { color: #d33; }
+  iframe { flex: 1; width: 100%; border: 0; background: #fff; }
+</style>
+</head>
+<body>
+<header>
+  <button id="back" title="Back" disabled>&larr;</button>
+  <button id="fwd" title="Forward" disabled>&rarr;</button>
+  <button id="reload" title="Reload">&#8635;</button>
+  <input id="url" type="text" placeholder="Enter a URL or search term" autocomplete="off" spellcheck="false">
+  <button id="go">Go</button>
+</header>
+<details>
+  <summary>Settings</summary>
+  <div>
+    <label>Mode
+      <select id="mode">
+        <option value="full">Full proxy (live sites)</option>
+        <option value="snapshot">Snapshot (simple pages)</option>
+      </select>
+    </label>
+    <label>Backend URL
+      <input id="backend" type="url" placeholder="https://your-proxy.onrender.com" style="min-width:260px">
+    </label>
+    <label>Relay
+      <select id="relay">
+        <option value="backend">Your Node.js backend (/fetch)</option>
+        <option value="https://api.allorigins.win/raw?url={url}">allorigins.win</option>
+        <option value="https://corsproxy.io/?url={url}">corsproxy.io</option>
+        <option value="custom">Custom&hellip;</option>
+      </select>
+    </label>
+    <input id="custom" type="text" placeholder="https://my-relay.example/fetch?url={url}" hidden>
+    <label><input id="scripts" type="checkbox"> Run page scripts</label>
+    <a id="statsLink" href="#" target="_blank" rel="noopener">Stats</a>
+  </div>
+</details>
+<div id="status"></div>
+<iframe id="view" sandbox="allow-scripts allow-forms" title="Proxied page"></iframe>
+
+<script>
+const $ = id => document.getElementById(id);
+const view = $('view'), urlBox = $('url'), statusEl = $('status');
+const history_ = []; let pos = -1;
+
+// ---- settings (localStorage is optional; ignore failures) ----
+const store = {
+  get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+const isFile = location.protocol === 'file:';
+if (isFile) $('relay').remove(0); // "This server" only works when served by proxy.js
+$('relay').value = store.get('relay', $('relay').options[0].value);
+if (!$('relay').value) $('relay').selectedIndex = 0;
+$('custom').value = store.get('custom', '');
+$('backend').value = store.get('backend', '');
+const backendBase = () => {
+  const raw = $('backend').value.trim() || (location.protocol === 'file:' ? '' : location.origin);
+  if (!raw) throw new Error('Enter your Node.js backend URL in Settings.');
+  const u = new URL(raw);
+  if (!/^https?:$/.test(u.protocol)) throw new Error('Backend URL must use http:// or https://');
+  return u.origin;
+};
+const updateBackendLinks = () => {
+  try { $('statsLink').href = backendBase() + '/stats'; } catch { $('statsLink').href = '#'; }
+};
+$('backend').addEventListener('change', () => { store.set('backend', $('backend').value.trim()); updateBackendLinks(); });
+updateBackendLinks();
+$('scripts').checked = store.get('scripts', '0') === '1';
+const syncCustom = () => { $('custom').hidden = $('relay').value !== 'custom'; };
+syncCustom();
+$('relay').onchange = () => { store.set('relay', $('relay').value); syncCustom(); };
+$('custom').onchange = () => store.set('custom', $('custom').value);
+$('scripts').onchange = () => store.set('scripts', $('scripts').checked ? '1' : '0');
+if (isFile) $('mode').querySelector('option[value=full]').remove(); // full mode needs proxy.js
+$('mode').value = isFile ? 'snapshot' : store.get('mode', 'full');
+$('mode').onchange = () => { store.set('mode', $('mode').value); updateNav(); };
+const mode = () => $('mode').value;
+
+function relayUrl(target) {
+  let tpl;
+  if ($('relay').value === 'backend') tpl = backendBase() + '/fetch?url={url}';
+  else tpl = $('relay').value === 'custom' ? $('custom').value.trim() : $('relay').value;
+  if (!tpl.includes('{url}')) throw new Error('Relay URL must contain {url}');
+  return tpl.replace('{url}', encodeURIComponent(target));
+}
+
+function setStatus(msg, isErr) { statusEl.textContent = msg; statusEl.className = isErr ? 'err' : ''; }
+
+function normalize(input) {
+  input = input.trim();
+  if (!input) return '';
+  if (/^https?:\/\//i.test(input)) return input;
+  if (/^[^\s]+\.[^\s]{2,}$/.test(input) && !input.includes(' ')) return 'https://' + input;
+  return 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(input);
+}
+
+// Runs inside the sandboxed page: sends link clicks and GET form submits to the parent.
+function navHook() {
+  document.addEventListener('click', e => {
+    const a = e.target.closest && e.target.closest('a[href]');
+    if (!a) return;
+    const h = a.getAttribute('href') || '';
+    if (h.startsWith('#') || /^(javascript|mailto|tel):/i.test(h)) return;
+    e.preventDefault();
+    parent.postMessage({ type: 'nav', url: a.href }, '*');
+  }, true);
+  document.addEventListener('submit', e => {
+    const f = e.target;
+    e.preventDefault();
+    if ((f.method || 'get').toLowerCase() !== 'get') {
+      parent.postMessage({ type: 'msg', text: 'POST forms are not supported by this proxy.' }, '*');
+      return;
+    }
+    const u = new URL(f.action || location.href);
+    new FormData(f).forEach((v, k) => { if (typeof v === 'string') u.searchParams.set(k, v); });
+    parent.postMessage({ type: 'nav', url: u.href }, '*');
+  }, true);
+}
+
+function absolutize(doc, base) {
+  const fix = (el, attr) => {
+    const v = el.getAttribute(attr);
+    if (!v || v.startsWith('#') || /^(javascript|data|blob|mailto|tel):/i.test(v)) return;
+    try { el.setAttribute(attr, new URL(v, base).href); } catch {}
+  };
+  doc.querySelectorAll('[href]').forEach(el => fix(el, 'href'));
+  doc.querySelectorAll('[src]').forEach(el => fix(el, 'src'));
+  doc.querySelectorAll('form').forEach(el => fix(el, 'action'));
+  doc.querySelectorAll('[srcset]').forEach(el => el.removeAttribute('srcset'));
+}
+
+function buildPage(html, base) {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  doc.querySelectorAll('meta[http-equiv]').forEach(m => m.remove()); // drop CSP / refresh tags
+  doc.querySelectorAll('base').forEach(b => b.remove());
+  if (!$('scripts').checked) doc.querySelectorAll('script').forEach(s => s.remove());
+  absolutize(doc, base);
+  const hook = doc.createElement('script');
+  hook.textContent = '(' + navHook.toString() + ')()';
+  doc.body.appendChild(hook);
+  return '<!DOCTYPE html>' + doc.documentElement.outerHTML;
+}
+
+async function load(target, push = true) {
+  if (!target) return;
+  urlBox.value = target;
+  if (mode() === 'full') return loadFull(target);
+  setStatus('Loading ' + target + ' …');
+  try {
+    const res = await fetch(relayUrl(target), { credentials: 'include' });
+    if (!res.ok) {
+      const why = (await res.text().catch(() => '')).replace(/<[^>]*>/g, ' ').trim().slice(0, 200);
+      throw new Error('Relay returned HTTP ' + res.status + (why ? ' (' + why + ')' : ''));
+    }
+    const html = await res.text();
+    view.setAttribute('sandbox', 'allow-scripts allow-forms');
+    view.srcdoc = buildPage(html, res.headers.get('X-Final-Url') || target);
+    if (push) { history_.splice(pos + 1); history_.push(target); pos = history_.length - 1; }
+    setStatus('');
+  } catch (err) {
+    const hint = err instanceof TypeError ? ' (network or CORS error — try another relay)' : '';
+    setStatus('Failed: ' + err.message + hint, true);
+  }
+  updateNav();
+}
+
+// Full mode: the page runs on this server, so the browser's own history does the work.
+function loadFull(target) {
+  view.removeAttribute('sandbox'); // live sites need cookies, storage and scripts
+  view.removeAttribute('srcdoc');
+  setStatus('Loading ' + target);
+  let base;
+  try { base = backendBase(); } catch (err) { setStatus(err.message, true); return; }
+  view.src = base + '/p/' + target;
+}
+function updateNav() {
+  if (mode() === 'full') { $('back').disabled = true; $('fwd').disabled = true; return; }
+  $('back').disabled = pos <= 0; $('fwd').disabled = pos >= history_.length - 1;
+}
+
+$('go').onclick = () => load(normalize(urlBox.value));
+urlBox.onkeydown = e => { if (e.key === 'Enter') $('go').click(); };
+$('reload').onclick = () => {
+  if (mode() === 'full') { const current = urlBox.value.trim(); if (current) loadFull(current); return; }
+  history_[pos] && load(history_[pos], false);
+};
+$('back').onclick = () => {
+  if (mode() === 'full') return;
+  if (pos > 0) { pos--; load(history_[pos], false); }
+};
+$('fwd').onclick = () => {
+  if (mode() === 'full') return;
+  if (pos < history_.length - 1) { pos++; load(history_[pos], false); }
+};
+
+window.addEventListener('message', e => {
+  if (e.source !== view.contentWindow || !e.data) return;
+  if (e.data.type === 'nav' && /^https?:\/\//i.test(e.data.url)) load(e.data.url);
+  if (e.data.type === 'msg') setStatus(e.data.text, true);
+});
+
+// Full mode: after every page load (including clicks inside the page) show the real address.
+view.addEventListener('load', () => {
+  if (mode() !== 'full') return;
+  try {
+    // The hosted UI and backend are cross-origin, so the parent cannot read the iframe URL.
+    setStatus('');
+  } catch {}
+});
+
+view.srcdoc = '<body style="font-family:system-ui;color:#777;display:grid;place-items:center;height:90vh;margin:0">Enter a URL above to begin.</body>';
+</script>
+</body>
+</html>

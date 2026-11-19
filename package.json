@@ -1,0 +1,9 @@
+{
+  "name": "github-hosted-web-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Node.js backend for a GitHub Pages-hosted web proxy UI",
+  "main": "Proxy.js",
+  "scripts": { "start": "node Proxy.js", "check": "node --check Proxy.js && node --check Fullproxy.js" },
+  "engines": { "node": ">=18" }
+}

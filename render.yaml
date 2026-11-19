@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: my-web-proxy-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FRONTEND_ORIGIN
+        sync: false
+      - key: PROXY_USER
+        sync: false
+      - key: PROXY_PASS
+        sync: false

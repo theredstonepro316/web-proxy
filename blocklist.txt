@@ -1,0 +1,6 @@
+# Sites the proxy will refuse. One per line. Lines starting with # are ignored.
+# "example.com" also blocks every subdomain, like ads.example.com.
+# Changes apply within a couple of seconds, no restart needed.
+doubleclick.net
+googlesyndication.com
+google-analytics.com
